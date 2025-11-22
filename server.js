@@ -1,179 +1,107 @@
 // server.js
 
 require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
-const { PrismaClient } = require('@prisma/client');
-const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-
-const prisma = new PrismaClient();
+const bcrypt = require('bcryptjs');
+const { PrismaClient, SwipeDirection } = require('@prisma/client');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
-
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
+const prisma = new PrismaClient();
 
 app.use(cors());
 app.use(express.json());
+
+// ---------- CONFIG ----------
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+const DAILY_SWIPE_LIMIT = Number(process.env.DAILY_SWIPE_LIMIT || 50);
 
 // ---------- HELPERS ----------
 
 function publicUser(user) {
   if (!user) return null;
-  return {
-    id: user.id,
-    name: user.name,
-    email: user.email,
-    age: user.age,
-    bio: user.bio,
-    gender: user.gender,
-    photoUrl: user.photoUrl || null,
-  };
+  const { password, passwordHash, ...rest } = user;
+  return rest;
 }
 
-function createToken(userId) {
-  return jwt.sign({ userId }, JWT_SECRET, { expiresIn: '30d' });
+function createToken(user) {
+  return jwt.sign({ userId: user.id }, JWT_SECRET, {
+    expiresIn: '30d',
+  });
 }
 
 function authMiddleware(req, res, next) {
-  const authHeader = req.headers['authorization'];
-  if (!authHeader) {
-    return res.status(401).json({ error: 'Missing Authorization header' });
+  const header = req.headers.authorization || '';
+
+  if (!header.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing or invalid token' });
   }
 
-  const [scheme, token] = authHeader.split(' ');
-
-  if (scheme !== 'Bearer' || !token) {
-    return res.status(401).json({ error: 'Invalid Authorization header' });
-  }
+  const token = header.substring('Bearer '.length);
 
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     req.userId = payload.userId;
     next();
   } catch (err) {
-    console.error('JWT verify error', err);
-    return res.status(401).json({ error: 'Invalid or expired token' });
+    console.error('JWT error', err);
+    return res.status(401).json({ error: 'Invalid token' });
   }
 }
 
-// Demo seed – upsert par usera
-async function seedDemoUsers() {
-  const demoUsers = [
-    {
-      name: 'Ana',
-      email: 'ana@example.com',
-      password: 'password123',
-      age: 25,
-      gender: 'female',
-      bio: 'Volim putovanja i kavu.',
-    },
-    {
-      name: 'Marko',
-      email: 'marko@example.com',
-      password: 'password123',
-      age: 28,
-      gender: 'male',
-      bio: 'Programer iz Zagreba.',
-    },
-    {
-      name: 'Lucija',
-      email: 'lucija@example.com',
-      password: 'password123',
-      age: 23,
-      gender: 'female',
-      bio: 'Fitness, glazba i Netflix.',
-    },
-    {
-      name: 'Ivan',
-      email: 'ivan@example.com',
-      password: 'password123',
-      age: 30,
-      gender: 'male',
-      bio: 'Volim more i jedrenje.',
-    },
-  ];
-
-  for (const demo of demoUsers) {
-    const existing = await prisma.user.findUnique({
-      where: { email: demo.email },
-    });
-    if (!existing) {
-      const passwordHash = await bcrypt.hash(demo.password, 10);
-      await prisma.user.create({
-        data: {
-          name: demo.name,
-          email: demo.email,
-          passwordHash,
-          age: demo.age,
-          gender: demo.gender,
-          bio: demo.bio,
-        },
-      });
-    }
-  }
-
-  console.log('Seeded demo users (ana/marko/lucija/ivan @ example.com)');
-}
-
-// ---------- ROUTES ----------
-
-// simple health
 app.get('/', (req, res) => {
-  res.json({ status: 'ok' });
+  res.json({ status: 'ok', message: 'Tinder backend up' });
 });
 
-// REGISTER
+// ---------- AUTH ROUTES ----------
+
 app.post('/auth/register', async (req, res) => {
   try {
-    const { name, email, password, age, bio, gender } = req.body;
+    const { name, email, password, gender, age, bio } = req.body;
 
-    if (!name || !email || !password) {
-      return res
-        .status(400)
-        .json({ error: 'Name, email and password are required' });
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password required' });
     }
 
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) {
-      return res.status(409).json({ error: 'User with that email exists' });
+      return res.status(400).json({ error: 'Email already in use' });
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
 
     const user = await prisma.user.create({
       data: {
-        name,
+        name: name || '',
         email,
         passwordHash,
+        gender: gender || null,
         age: age ?? null,
-        bio: bio ?? null,
-        gender: gender ?? null,
+        bio: bio || '',
       },
     });
 
-    const token = createToken(user.id);
+    const token = createToken(user);
 
-    return res.json({ token, user: publicUser(user) });
+    return res.json({
+      token,
+      user: publicUser(user),
+    });
   } catch (err) {
     console.error('Register error', err);
-    return res.status(500).json({ error: 'Failed to register' });
+    return res.status(500).json({ error: 'Register failed' });
   }
 });
 
-// LOGIN
 app.post('/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
+
     if (!email || !password) {
-      return res
-        .status(400)
-        .json({ error: 'Email and password are required' });
+      return res.status(400).json({ error: 'Email and password required' });
     }
 
     const user = await prisma.user.findUnique({ where: { email } });
@@ -181,36 +109,49 @@ app.post('/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    const valid = await bcrypt.compare(password, user.passwordHash);
-    if (!valid) {
+    const ok = await bcrypt.compare(password, user.passwordHash || '');
+    if (!ok) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    const token = createToken(user.id);
-    return res.json({ token, user: publicUser(user) });
+    const token = createToken(user);
+
+    return res.json({
+      token,
+      user: publicUser(user),
+    });
   } catch (err) {
     console.error('Login error', err);
-    return res.status(500).json({ error: 'Failed to login' });
+    return res.status(500).json({ error: 'Login failed' });
   }
 });
 
-// CURRENT USER
+app.get('/auth/me', authMiddleware, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.userId },
+    });
+    return res.json(publicUser(user));
+  } catch (err) {
+    console.error('auth/me error', err);
+    return res.status(500).json({ error: 'Failed to load user' });
+  }
+});
+
 app.get('/me', authMiddleware, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({
       where: { id: req.userId },
     });
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
     return res.json(publicUser(user));
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Failed to get user' });
+    console.error('GET /me error', err);
+    return res.status(500).json({ error: 'Failed to load profile' });
   }
 });
 
-// UPDATE PROFILE (name, age, bio, gender, photoUrl)
+// ---------- PROFILE UPDATE (/me PUT) ----------
+
 app.put('/me', authMiddleware, async (req, res) => {
   try {
     const { name, age, bio, gender, photoUrl } = req.body;
@@ -250,80 +191,109 @@ app.put('/me', authMiddleware, async (req, res) => {
 
     return res.json(publicUser(updated));
   } catch (err) {
-    console.error(err);
+    console.error('PUT /me error', err);
     return res.status(500).json({ error: 'Failed to update profile' });
   }
 });
 
-// RECOMMENDATIONS + FILTERI
-app.get('/profiles/recommendations', authMiddleware, async (req, res) => {
-  try {
-    const userId = req.userId;
-    const { gender, minAge, maxAge } = req.query;
+// ---------- RECOMMENDATIONS / FILTERS ----------
 
-    const userSwipes = await prisma.swipe.findMany({
+app.get('/profiles/recommendations', async (req, res) => {
+  try {
+    const { userId, gender, minAge, maxAge } = req.query;
+
+    if (!userId || typeof userId !== 'string') {
+      return res.status(400).json({ error: 'userId is required' });
+    }
+
+    const currentUser = await prisma.user.findUnique({
+      where: { id: userId },
+    });
+
+    if (!currentUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const swipes = await prisma.swipe.findMany({
       where: { fromUserId: userId },
       select: { toUserId: true },
     });
 
-    const excludedIds = [
-      userId,
-      ...userSwipes.map((s) => s.toUserId),
-    ];
+    const alreadySwipedIds = swipes.map((s) => s.toUserId);
+
+    const minAgeNum = minAge ? Number(minAge) : undefined;
+    const maxAgeNum = maxAge ? Number(maxAge) : undefined;
+
+    const ageFilter = {};
+    if (!Number.isNaN(minAgeNum)) ageFilter.gte = minAgeNum;
+    if (!Number.isNaN(maxAgeNum)) ageFilter.lte = maxAgeNum;
 
     const where = {
-      id: { notIn: excludedIds },
+      id: {
+        not: userId,
+        notIn: alreadySwipedIds,
+      },
     };
 
-    if (typeof gender === 'string' && gender.trim().length > 0) {
+    if (Object.keys(ageFilter).length > 0) {
+      where.age = ageFilter;
+    }
+
+    if (
+      typeof gender === 'string' &&
+      gender.trim().length > 0 &&
+      gender !== 'male/female/other'
+    ) {
       where.gender = gender.trim();
     }
 
-    if (minAge || maxAge) {
-      where.age = {};
-      if (minAge) {
-        const n = Number(minAge);
-        if (!Number.isNaN(n)) {
-          where.age.gte = n;
-        }
-      }
-      if (maxAge) {
-        const n = Number(maxAge);
-        if (!Number.isNaN(n)) {
-          where.age.lte = n;
-        }
-      }
-    }
-
-    const users = await prisma.user.findMany({
+    const profiles = await prisma.user.findMany({
       where,
       orderBy: { createdAt: 'desc' },
-      take: 50,
     });
 
-    return res.json(users.map(publicUser));
+    return res.json(profiles.map(publicUser));
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Failed to load recommendations' });
+    console.error('GET /profiles/recommendations error', err);
+    return res.status(500).json({ error: 'Failed to load profiles' });
   }
 });
 
-// CREATE SWIPE (like / pass / superlike)
-app.post('/swipes', authMiddleware, async (req, res) => {
-  try {
-    const fromUserId = req.userId;
-    const { toUserId, direction } = req.body;
+// ---------- SWIPES & MATCHING ----------
 
-    if (!toUserId || !direction) {
-      return res
-        .status(400)
-        .json({ error: 'toUserId and direction are required' });
+async function countTodaySwipes(fromUserId) {
+  const startOfDay = new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+
+  const count = await prisma.swipe.count({
+    where: {
+      fromUserId,
+      createdAt: { gte: startOfDay },
+      direction: { in: [SwipeDirection.like, SwipeDirection.superlike] },
+    },
+  });
+
+  return count;
+}
+
+app.post('/swipes', async (req, res) => {
+  try {
+    const { fromUserId, toUserId, direction } = req.body;
+
+    if (!fromUserId || !toUserId || !direction) {
+      return res.status(400).json({ error: 'Missing fields' });
     }
 
-    const allowedDirections = ['like', 'pass', 'superlike'];
-    if (!allowedDirections.includes(direction)) {
-      return res.status(400).json({
-        error: 'direction must be like, pass or superlike',
+    if (!Object.values(SwipeDirection).includes(direction)) {
+      return res.status(400).json({ error: 'Invalid swipe direction' });
+    }
+
+    const todaySwipes = await countTodaySwipes(fromUserId);
+
+    if (todaySwipes >= DAILY_SWIPE_LIMIT) {
+      return res.status(429).json({
+        error: 'Daily swipe limit reached',
+        limit: DAILY_SWIPE_LIMIT,
       });
     }
 
@@ -336,47 +306,64 @@ app.post('/swipes', authMiddleware, async (req, res) => {
     });
 
     let isMatch = false;
+    let match = null;
 
-    if (direction === 'like' || direction === 'superlike') {
-      const oppositeLike = await prisma.swipe.findFirst({
+    if (
+      direction === SwipeDirection.like ||
+      direction === SwipeDirection.superlike
+    ) {
+      const opposite = await prisma.swipe.findFirst({
         where: {
           fromUserId: toUserId,
           toUserId: fromUserId,
           direction: {
-            in: ['like', 'superlike'],
+            in: [SwipeDirection.like, SwipeDirection.superlike],
           },
         },
       });
 
-      if (oppositeLike) {
+      if (opposite) {
         isMatch = true;
 
-        const [user1Id, user2Id] =
-          fromUserId < toUserId
-            ? [fromUserId, toUserId]
-            : [toUserId, fromUserId];
-
-        await prisma.match.upsert({
+        match = await prisma.match.findFirst({
           where: {
-            user1Id_user2Id: { user1Id, user2Id },
+            OR: [
+              { user1Id: fromUserId, user2Id: toUserId },
+              { user1Id: toUserId, user2Id: fromUserId },
+            ],
           },
-          update: {},
-          create: { user1Id, user2Id },
         });
+
+        if (!match) {
+          match = await prisma.match.create({
+            data: {
+              user1Id: fromUserId,
+              user2Id: toUserId,
+            },
+          });
+        }
       }
     }
 
-    return res.json({ match: isMatch, swipeId: swipe.id });
+    return res.json({
+      success: true,
+      swipeId: swipe.id,
+      match: isMatch,
+      matchId: match ? match.id : null,
+    });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Failed to create swipe' });
+    console.error('POST /swipes error', err);
+    return res.status(500).json({ error: 'Failed to record swipe' });
   }
 });
 
-// UNDO LAST SWIPE
-app.post('/swipes/undo', authMiddleware, async (req, res) => {
+async function handleUndoLastSwipe(req, res) {
   try {
-    const userId = req.userId;
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'userId is required' });
+    }
 
     const lastSwipe = await prisma.swipe.findFirst({
       where: { fromUserId: userId },
@@ -384,67 +371,45 @@ app.post('/swipes/undo', authMiddleware, async (req, res) => {
     });
 
     if (!lastSwipe) {
-      return res.status(400).json({ error: 'No swipes to undo' });
+      return res.status(404).json({ error: 'No swipe to undo' });
     }
 
     await prisma.swipe.delete({ where: { id: lastSwipe.id } });
 
-    let removedMatch = false;
-
-    if (lastSwipe.direction === 'like' || lastSwipe.direction === 'superlike') {
-      const remainingAtoB = await prisma.swipe.findFirst({
+    if (
+      lastSwipe.direction === SwipeDirection.like ||
+      lastSwipe.direction === SwipeDirection.superlike
+    ) {
+      const match = await prisma.match.findFirst({
         where: {
-          fromUserId: userId,
-          toUserId: lastSwipe.toUserId,
-          direction: { in: ['like', 'superlike'] },
-        },
-      });
-      const remainingBtoA = await prisma.swipe.findFirst({
-        where: {
-          fromUserId: lastSwipe.toUserId,
-          toUserId: userId,
-          direction: { in: ['like', 'superlike'] },
+          OR: [
+            { user1Id: userId, user2Id: lastSwipe.toUserId },
+            { user1Id: lastSwipe.toUserId, user2Id: userId },
+          ],
         },
       });
 
-      if (!remainingAtoB || !remainingBtoA) {
-        const [user1Id, user2Id] =
-          userId < lastSwipe.toUserId
-            ? [userId, lastSwipe.toUserId]
-            : [lastSwipe.toUserId, userId];
-
-        const match = await prisma.match.findUnique({
-          where: {
-            user1Id_user2Id: { user1Id, user2Id },
-          },
-        });
-
-        if (match) {
-          await prisma.message.deleteMany({
-            where: { matchId: match.id },
-          });
-          await prisma.match.delete({ where: { id: match.id } });
-          removedMatch = true;
-        }
+      if (match) {
+        await prisma.message.deleteMany({ where: { matchId: match.id } });
+        await prisma.match.delete({ where: { id: match.id } });
       }
     }
 
     return res.json({
-      undone: true,
-      removedMatch,
-      lastSwipe: {
-        id: lastSwipe.id,
-        toUserId: lastSwipe.toUserId,
-        direction: lastSwipe.direction,
-      },
+      success: true,
+      undoneSwipeId: lastSwipe.id,
     });
   } catch (err) {
-    console.error(err);
+    console.error('POST /swipes/undo error', err);
     return res.status(500).json({ error: 'Failed to undo swipe' });
   }
-});
+}
 
-// MATCHES LIST
+app.post('/swipes/undo', handleUndoLastSwipe);
+app.post('/swipes/undo-last', handleUndoLastSwipe);
+
+// ---------- MATCHES & CHATS ----------
+
 app.get('/matches', authMiddleware, async (req, res) => {
   try {
     const userId = req.userId;
@@ -465,28 +430,30 @@ app.get('/matches', authMiddleware, async (req, res) => {
     });
 
     const result = matches.map((m) => {
-      const otherUser = m.user1Id === userId ? m.user2 : m.user1;
+      const other =
+        m.user1Id === userId ? publicUser(m.user2) : publicUser(m.user1);
+
       const lastMessage = m.messages[0] || null;
 
       return {
         id: m.id,
-        otherUser: publicUser(otherUser),
+        otherUser: other,
+        createdAt: m.createdAt,
         lastMessage,
       };
     });
 
     return res.json(result);
   } catch (err) {
-    console.error(err);
+    console.error('GET /matches error', err);
     return res.status(500).json({ error: 'Failed to load matches' });
   }
 });
 
-// MESSAGES IN MATCH
 app.get('/matches/:matchId/messages', authMiddleware, async (req, res) => {
   try {
     const userId = req.userId;
-    const { matchId } = req.params;
+    const matchId = req.params.matchId;
 
     const match = await prisma.match.findUnique({
       where: { id: matchId },
@@ -497,7 +464,7 @@ app.get('/matches/:matchId/messages', authMiddleware, async (req, res) => {
     }
 
     if (match.user1Id !== userId && match.user2Id !== userId) {
-      return res.status(403).json({ error: 'Not part of this match' });
+      return res.status(403).json({ error: 'Not your match' });
     }
 
     const messages = await prisma.message.findMany({
@@ -507,32 +474,27 @@ app.get('/matches/:matchId/messages', authMiddleware, async (req, res) => {
 
     return res.json(messages);
   } catch (err) {
-    console.error(err);
+    console.error('GET /matches/:matchId/messages error', err);
     return res.status(500).json({ error: 'Failed to load messages' });
   }
 });
 
-// SEND MESSAGE
 app.post('/matches/:matchId/messages', authMiddleware, async (req, res) => {
   try {
     const userId = req.userId;
-    const { matchId } = req.params;
+    const matchId = req.params.matchId;
     const { text } = req.body;
 
-    if (!text || !text.trim()) {
-      return res.status(400).json({ error: 'Text is required' });
+    if (!text || typeof text !== 'string' || !text.trim()) {
+      return res.status(400).json({ error: 'Text required' });
     }
 
     const match = await prisma.match.findUnique({
       where: { id: matchId },
     });
 
-    if (!match) {
-      return res.status(404).json({ error: 'Match not found' });
-    }
-
     if (match.user1Id !== userId && match.user2Id !== userId) {
-      return res.status(403).json({ error: 'Not part of this match' });
+      return res.status(403).json({ error: 'Not your match' });
     }
 
     const message = await prisma.message.create({
@@ -545,20 +507,77 @@ app.post('/matches/:matchId/messages', authMiddleware, async (req, res) => {
 
     return res.json(message);
   } catch (err) {
-    console.error(err);
+    console.error('POST /matches/:matchId/messages error', err);
     return res.status(500).json({ error: 'Failed to send message' });
   }
 });
 
+// ---------- SEED DEMO USERS ----------
+
+async function seedDemoUsers() {
+  const passwordHash = await bcrypt.hash('password123', 10);
+
+  const demoUsers = [
+    {
+      email: 'ana@example.com',
+      name: 'Ana',
+      age: 25,
+      gender: 'female',
+      bio: 'Voli putovanja i dobru hranu.',
+      photoUrl: null,
+    },
+    {
+      email: 'marko@example.com',
+      name: 'Marko',
+      age: 28,
+      gender: 'male',
+      bio: 'Gym, travel, good food.',
+      photoUrl: null,
+    },
+    {
+      email: 'lucija@example.com',
+      name: 'Lucija',
+      age: 27,
+      gender: 'female',
+      bio: 'Marketing, coffee, more coffee.',
+      photoUrl: null,
+    },
+    {
+      email: 'ivan@example.com',
+      name: 'Ivan',
+      age: 30,
+      gender: 'male',
+      bio: 'Software developer and gamer.',
+      photoUrl: null,
+    },
+  ];
+
+  for (const u of demoUsers) {
+    await prisma.user.upsert({
+      where: { email: u.email },
+      update: {},
+      create: {
+        ...u,
+        passwordHash,
+      },
+    });
+  }
+
+  console.log(
+    'Seeded demo users (ana/marko/lucija/ivan @ example.com)'
+  );
+}
+
 // ---------- START SERVER ----------
 
-async function start() {
+const PORT = process.env.PORT || 3000;
+
+async function main() {
   try {
-    await prisma.$connect();
     await seedDemoUsers();
 
     app.listen(PORT, () => {
-      console.log(`API server running on http://localhost:${PORT}`);
+      console.log(`Server listening on port ${PORT}`);
     });
   } catch (err) {
     console.error('Failed to start server', err);
@@ -566,4 +585,4 @@ async function start() {
   }
 }
 
-start();
+main();

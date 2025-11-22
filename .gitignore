@@ -1,0 +1,5 @@
+type NUL > .gitignore
+node_modules
+.env
+npm-debug.log*
+dist

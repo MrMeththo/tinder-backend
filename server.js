@@ -1,197 +1,167 @@
-// server.js
 require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const { PrismaClient } = require('@prisma/client');
 
-// morgan je opcionalan – ako nije instaliran, server će svejedno raditi
 let morgan = null;
 try {
-  // npm install morgan  (ako želiš logove requesta)
   morgan = require('morgan');
-} catch (err) {
-  console.warn('morgan not installed, request logging disabled');
+} catch (e) {
+  console.warn('morgan not installed, skipping request logging');
 }
 
 const prisma = new PrismaClient();
+
 const app = express();
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
-const SWIPES_PER_DAY = Number(process.env.SWIPES_PER_DAY) || 50;
 
-// --------- GLOBAL MIDDLEWARE ---------
-app.set('trust proxy', 1);
-app.use(cors());
-app.use(express.json());
+// ---------- MIDDLEWARE ----------
+
 app.use(helmet());
+app.use(
+  cors({
+    origin: '*',
+  })
+);
+app.use(express.json());
 
 if (morgan) {
-  app.use(morgan('combined'));
+  app.use(morgan('tiny'));
 }
 
-// rate limit za cijeli API (lagani)
-const apiLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 min
-  max: 120,            // 120 requesta u minuti
-  standardHeaders: true,
-  legacyHeaders: false,
+// global rate limit (osnovna zaštita)
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 1000,
 });
+app.use(globalLimiter);
 
-app.use(apiLimiter);
+// jači limit za auth rute
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 50,
+});
+app.use('/auth', authLimiter);
 
-// ---------- HELPER FUNKCIJE ----------
-
-function createToken(user) {
-  return jwt.sign(
-    {
-      sub: user.id,
-      email: user.email,
-    },
-    JWT_SECRET,
-    { expiresIn: '7d' }
-  );
-}
-
+// helper – javni prikaz usera
 function publicUser(user) {
   if (!user) return null;
+
+  const ONLINE_WINDOW_MS = 2 * 60 * 1000; // 2 minute
+  const lastActive = user.lastActiveAt || user.updatedAt || user.createdAt;
+  const isOnline =
+    lastActive && Date.now() - new Date(lastActive).getTime() < ONLINE_WINDOW_MS;
+
   return {
     id: user.id,
     email: user.email,
     name: user.name,
     age: user.age,
-    gender: user.gender,
     bio: user.bio,
-    photoUrl: user.photoUrl || null,
+    gender: user.gender,
+    photoUrl: user.photoUrl,
+    createdAt: user.createdAt,
+    lastActiveAt: lastActive,
+    isOnline,
   };
 }
+
+// auth middleware
+async function authMiddleware(req, res, next) {
+  const header = req.headers.authorization || '';
+  const [, token] = header.split(' ');
+
+  if (!token) {
+    return res.status(401).json({ error: 'Missing auth token' });
+  }
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.userId = payload.userId;
+
+    // update lastActiveAt
+    try {
+      await prisma.user.update({
+        where: { id: payload.userId },
+        data: { lastActiveAt: new Date() },
+      });
+    } catch (e) {
+      console.error('Failed to update lastActiveAt', e);
+    }
+
+    next();
+  } catch (err) {
+    console.error('authMiddleware error', err);
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// ---------- SEED DEMO USERS ----------
 
 async function seedDemoUsers() {
   const demoUsers = [
     {
       email: 'ana@example.com',
       name: 'Ana',
+      age: 26,
+      bio: 'Volim putovanja, kavu i dobar razgovor.',
       gender: 'female',
-      age: 25,
-      bio: 'Gym, travel, good food.',
-      photoUrl:
-        'https://images.pexels.com/photos/415829/pexels-photo-415829.jpeg',
     },
     {
       email: 'marko@example.com',
       name: 'Marko',
-      gender: 'male',
       age: 28,
-      bio: 'Software developer and gamer.',
-      photoUrl:
-        'https://images.pexels.com/photos/614810/pexels-photo-614810.jpeg',
+      bio: 'Gym, travel, good food.',
+      gender: 'male',
     },
     {
       email: 'lucija@example.com',
       name: 'Lucija',
+      age: 24,
+      bio: 'Tech, knjige i more.',
       gender: 'female',
-      age: 27,
-      bio: 'Coffee lover, books, dogs.',
-      photoUrl:
-        'https://images.pexels.com/photos/415829/pexels-photo-415829.jpeg',
     },
     {
       email: 'ivan@example.com',
       name: 'Ivan',
-      gender: 'male',
       age: 30,
-      bio: 'Outdoors, hiking, good vibes.',
-      photoUrl:
-        'https://images.pexels.com/photos/91227/pexels-photo-91227.jpeg',
+      bio: 'Volim more i jedrenje.',
+      gender: 'male',
     },
   ];
 
-  const password = 'password123';
-  const passwordHash = await bcrypt.hash(password, 10);
+  const passwordHash = await bcrypt.hash('password123', 10);
 
-  for (const u of demoUsers) {
+  for (const demo of demoUsers) {
     await prisma.user.upsert({
-      where: { email: u.email },
+      where: { email: demo.email },
       update: {},
       create: {
-        email: u.email,
-        name: u.name,
-        gender: u.gender,
-        age: u.age,
-        bio: u.bio,
-        photoUrl: u.photoUrl,
+        email: demo.email,
         passwordHash,
+        name: demo.name,
+        age: demo.age,
+        bio: demo.bio,
+        gender: demo.gender,
       },
     });
   }
 
-  console.log(
-    'Seeded demo users (ana/marko/lucija/ivan @ example.com, password: password123)'
-  );
+  console.log('Seeded demo users (ana/marko/lucija/ivan @ example.com)');
 }
 
-async function getSwipesTodayCount(userId) {
-  const since = new Date();
-  since.setHours(0, 0, 0, 0); // od početka dana
+// ---------- AUTH ROUTES ----------
 
-  return prisma.swipe.count({
-    where: {
-      fromUserId: userId,
-      createdAt: {
-        gte: since,
-      },
-    },
-  });
-}
-
-// ---------- AUTH MIDDLEWARE ----------
-
-async function authMiddleware(req, res, next) {
-  try {
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ')
-      ? authHeader.slice(7)
-      : null;
-
-    if (!token) {
-      return res.status(401).json({ error: 'Missing Authorization header' });
-    }
-
-    const payload = jwt.verify(token, JWT_SECRET);
-
-    req.userId = payload.sub;
-    req.userEmail = payload.email;
-    next();
-  } catch (err) {
-    console.error('Auth error:', err.message);
-    return res.status(401).json({ error: 'Invalid or expired token' });
-  }
-}
-
-// ---------- ROUTES ----------
-
-// Health-check (Render ping, monitoring, itd.)
-app.get('/health', async (req, res) => {
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    return res.json({ status: 'ok' });
-  } catch (err) {
-    console.error('Health check failed:', err);
-    return res.status(500).json({ status: 'error', error: 'DB check failed' });
-  }
-});
-
-// ----- AUTH -----
-
-// Registracija
 app.post('/auth/register', async (req, res) => {
   try {
-    const { email, password, name, age, gender, bio, photoUrl } = req.body;
+    const { email, password, name, age, gender } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
@@ -199,7 +169,7 @@ app.post('/auth/register', async (req, res) => {
 
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) {
-      return res.status(409).json({ error: 'User with this email already exists' });
+      return res.status(409).json({ error: 'User already exists' });
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
@@ -211,57 +181,63 @@ app.post('/auth/register', async (req, res) => {
         name: name || email.split('@')[0],
         age: age ? Number(age) : null,
         gender: gender || null,
-        bio: bio || '',
-        photoUrl: photoUrl || null,
       },
     });
 
-    const token = createToken(user);
-    return res.status(201).json({ token, user: publicUser(user) });
+    const token = jwt.sign({ userId: user.id }, JWT_SECRET, {
+      expiresIn: '30d',
+    });
+
+    return res.status(201).json({
+      token,
+      user: publicUser(user),
+    });
   } catch (err) {
     console.error('POST /auth/register error:', err);
-    return res.status(500).json({ error: 'Failed to register user' });
+    return res.status(500).json({ error: 'Failed to register' });
   }
 });
 
-// Login
 app.post('/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
+
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
     const user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
-      return res.status(401).json({ error: 'Invalid email or password' });
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
 
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) {
-      return res.status(401).json({ error: 'Invalid email or password' });
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    const token = createToken(user);
-    return res.json({ token, user: publicUser(user) });
+    const token = jwt.sign({ userId: user.id }, JWT_SECRET, {
+      expiresIn: '30d',
+    });
+
+    return res.json({
+      token,
+      user: publicUser(user),
+    });
   } catch (err) {
     console.error('POST /auth/login error:', err);
     return res.status(500).json({ error: 'Failed to login' });
   }
 });
 
-// ----- USER / PROFILE -----
+// ---------- ME / PROFILE ----------
 
-// Trenutni user
 app.get('/me', authMiddleware, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({
       where: { id: req.userId },
     });
-
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
     return res.json(publicUser(user));
   } catch (err) {
@@ -270,7 +246,6 @@ app.get('/me', authMiddleware, async (req, res) => {
   }
 });
 
-// Update profila (uključuje i photoUrl)
 app.put('/me', authMiddleware, async (req, res) => {
   try {
     const { name, age, bio, gender, photoUrl } = req.body;
@@ -315,97 +290,112 @@ app.put('/me', authMiddleware, async (req, res) => {
   }
 });
 
-// ----- RECOMMENDATIONS + FILTERI -----
+// ---------- RECOMMENDATIONS / SWIPES ----------
 
+// helper – dnevni limit swipova
+const DAILY_SWIPE_LIMIT = 50;
+
+async function getTodaySwipeCount(userId) {
+  const startOfDay = new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+
+  const count = await prisma.swipe.count({
+    where: {
+      fromUserId: userId,
+      createdAt: {
+        gte: startOfDay,
+      },
+    },
+  });
+
+  return count;
+}
+
+// GET /profiles/recommendations?gender=&minAge=&maxAge=
 app.get('/profiles/recommendations', authMiddleware, async (req, res) => {
   try {
     const userId = req.userId;
     const { gender, minAge, maxAge } = req.query;
 
-    const where = {
-      id: { not: userId },
-    };
-
-    // age filter
-    const ageFilter = {};
-    if (minAge !== undefined && minAge !== '') {
-      const parsed = Number(minAge);
-      if (Number.isNaN(parsed)) {
-        return res.status(400).json({ error: 'Invalid minAge' });
-      }
-      ageFilter.gte = parsed;
+    const me = await prisma.user.findUnique({ where: { id: userId } });
+    if (!me) {
+      return res.status(404).json({ error: 'User not found' });
     }
 
-    if (maxAge !== undefined && maxAge !== '') {
-      const parsed = Number(maxAge);
-      if (Number.isNaN(parsed)) {
-        return res.status(400).json({ error: 'Invalid maxAge' });
-      }
-      ageFilter.lte = parsed;
-    }
-
-    if (Object.keys(ageFilter).length > 0) {
-      where.age = ageFilter;
-    }
-
-    if (typeof gender === 'string' && gender.trim().length > 0) {
-      where.gender = gender.trim();
-    }
-
-    // isključi već swipane
-    const alreadySwiped = await prisma.swipe.findMany({
+    // ids koje sam već swipeao ili matchao
+    const swipes = await prisma.swipe.findMany({
       where: { fromUserId: userId },
       select: { toUserId: true },
     });
 
-    const excluded = alreadySwiped.map((s) => s.toUserId);
-    if (excluded.length > 0) {
-      where.id = { notIn: [...excluded, userId] };
+    const matched = await prisma.match.findMany({
+      where: {
+        OR: [{ user1Id: userId }, { user2Id: userId }],
+      },
+      select: {
+        user1Id: true,
+        user2Id: true,
+      },
+    });
+
+    const excludedIds = new Set();
+    swipes.forEach((s) => excludedIds.add(s.toUserId));
+    matched.forEach((m) => {
+      excludedIds.add(m.user1Id);
+      excludedIds.add(m.user2Id);
+    });
+    excludedIds.add(userId);
+
+    const where = {
+      id: { notIn: Array.from(excludedIds) },
+    };
+
+    if (gender && typeof gender === 'string' && gender !== 'male/female/other') {
+      where.gender = gender;
+    }
+
+    if (minAge || maxAge) {
+      where.age = {};
+      if (minAge) where.age.gte = Number(minAge);
+      if (maxAge) where.age.lte = Number(maxAge);
     }
 
     const candidates = await prisma.user.findMany({
       where,
-      orderBy: { id: 'desc' },
+      orderBy: [
+        { createdAt: 'desc' },
+        { id: 'asc' },
+      ],
       take: 50,
     });
 
     return res.json(candidates.map(publicUser));
   } catch (err) {
     console.error('GET /profiles/recommendations error:', err);
-    return res
-      .status(500)
-      .json({ error: 'Failed to load profile recommendations' });
+    return res.status(500).json({ error: 'Failed to load profiles' });
   }
 });
 
-// ----- SWIPES + UNDO + MATCH -----
-
+// POST /swipes { toUserId, direction }
 app.post('/swipes', authMiddleware, async (req, res) => {
   try {
     const fromUserId = req.userId;
     const { toUserId, direction } = req.body;
 
-    if (!toUserId || !direction) {
-      return res
-        .status(400)
-        .json({ error: 'toUserId and direction are required' });
+    if (!toUserId || !['like', 'pass', 'superlike'].includes(direction)) {
+      return res.status(400).json({ error: 'Invalid swipe payload' });
     }
 
-    if (!['like', 'pass', 'superlike'].includes(direction)) {
-      return res.status(400).json({ error: 'Invalid swipe direction' });
-    }
-
-    // dnevni limit
-    const swipesToday = await getSwipesTodayCount(fromUserId);
-    if (swipesToday >= SWIPES_PER_DAY) {
+    // daily limit
+    const todayCount = await getTodaySwipeCount(fromUserId);
+    if (todayCount >= DAILY_SWIPE_LIMIT) {
       return res.status(429).json({
         error: 'Daily swipe limit reached',
-        swipesToday,
-        limit: SWIPES_PER_DAY,
+        limit: DAILY_SWIPE_LIMIT,
       });
     }
 
-    // kreiraj swipe
+    // spremi swipe
     const swipe = await prisma.swipe.create({
       data: {
         fromUserId,
@@ -414,11 +404,10 @@ app.post('/swipes', authMiddleware, async (req, res) => {
       },
     });
 
-    let isMatch = false;
+    // jel postoji obostrani like?
     let match = null;
-
     if (direction === 'like' || direction === 'superlike') {
-      const reciprocal = await prisma.swipe.findFirst({
+      const reverseLike = await prisma.swipe.findFirst({
         where: {
           fromUserId: toUserId,
           toUserId: fromUserId,
@@ -426,8 +415,8 @@ app.post('/swipes', authMiddleware, async (req, res) => {
         },
       });
 
-      if (reciprocal) {
-        // provjeri postoji li već match
+      if (reverseLike) {
+        // provjeri da već nemamo match
         match = await prisma.match.findFirst({
           where: {
             OR: [
@@ -445,26 +434,22 @@ app.post('/swipes', authMiddleware, async (req, res) => {
             },
           });
         }
-
-        isMatch = true;
       }
     }
 
-    return res.status(201).json({
-      swipe,
-      match: match || null,
-      isMatch,
-      swipesToday: swipesToday + 1,
-      limit: SWIPES_PER_DAY,
+    return res.json({
+      swipeId: swipe.id,
+      match: !!match,
+      matchId: match ? match.id : null,
     });
   } catch (err) {
     console.error('POST /swipes error:', err);
-    return res.status(500).json({ error: 'Failed to process swipe' });
+    return res.status(500).json({ error: 'Failed to send swipe' });
   }
 });
 
-// Undo zadnjeg swipa
-app.post('/swipes/undo-last', authMiddleware, async (req, res) => {
+// POST /swipes/undo – undo zadnjeg swipa
+app.post('/swipes/undo', authMiddleware, async (req, res) => {
   try {
     const userId = req.userId;
 
@@ -474,51 +459,62 @@ app.post('/swipes/undo-last', authMiddleware, async (req, res) => {
     });
 
     if (!lastSwipe) {
-      return res.status(404).json({ error: 'No swipe to undo' });
+      return res.status(400).json({ error: 'No swipe to undo' });
     }
 
-    // ako je napravio match, pokušaj obrisati i match
-    await prisma.$transaction(async (tx) => {
-      // moguće da match ne postoji, pa ignore error
-      const match = await tx.match.findFirst({
-        where: {
-          OR: [
-            {
-              user1Id: lastSwipe.fromUserId,
-              user2Id: lastSwipe.toUserId,
-            },
-            {
-              user1Id: lastSwipe.toUserId,
-              user2Id: lastSwipe.fromUserId,
-            },
-          ],
-        },
+    // ako je od tog swipa nastao match, brišemo ga + poruke
+    const match = await prisma.match.findFirst({
+      where: {
+        OR: [
+          { user1Id: userId, user2Id: lastSwipe.toUserId },
+          { user1Id: lastSwipe.toUserId, user2Id: userId },
+        ],
+      },
+    });
+
+    if (match) {
+      await prisma.message.deleteMany({
+        where: { matchId: match.id },
       });
 
-      if (match) {
-        await tx.message.deleteMany({ where: { matchId: match.id } });
-        await tx.match.delete({ where: { id: match.id } });
-      }
+      await prisma.match.delete({
+        where: { id: match.id },
+      });
+    }
 
-      await tx.swipe.delete({ where: { id: lastSwipe.id } });
+    await prisma.swipe.delete({
+      where: { id: lastSwipe.id },
     });
 
-    const swipesToday = await getSwipesTodayCount(userId);
-
-    return res.json({
-      undoneSwipeId: lastSwipe.id,
-      swipesToday,
-      limit: SWIPES_PER_DAY,
-    });
+    return res.json({ ok: true });
   } catch (err) {
-    console.error('POST /swipes/undo-last error:', err);
+    console.error('POST /swipes/undo error:', err);
     return res.status(500).json({ error: 'Failed to undo swipe' });
   }
 });
 
-// ----- MATCHES + CHATS -----
+// ---------- MATCHES & CHAT ----------
 
-// lista match-eva + basic info
+// helper – format matcha s drugim userom
+function formatMatch(meId, match, otherUser, lastMessage, unreadCount) {
+  return {
+    id: match.id,
+    createdAt: match.createdAt,
+    otherUser: publicUser(otherUser),
+    lastMessage: lastMessage
+      ? {
+          id: lastMessage.id,
+          fromUserId: lastMessage.fromUserId,
+          toUserId: lastMessage.toUserId,
+          content: lastMessage.content,
+          createdAt: lastMessage.createdAt,
+        }
+      : null,
+    unreadCount,
+  };
+}
+
+// GET /matches
 app.get('/matches', authMiddleware, async (req, res) => {
   try {
     const userId = req.userId;
@@ -527,34 +523,33 @@ app.get('/matches', authMiddleware, async (req, res) => {
       where: {
         OR: [{ user1Id: userId }, { user2Id: userId }],
       },
-      include: {
-        user1: true,
-        user2: true,
-        messages: {
-          orderBy: { createdAt: 'desc' },
-          take: 1,
-        },
-      },
       orderBy: { createdAt: 'desc' },
     });
 
-    const result = matches.map((m) => {
-      const otherUser = m.user1Id === userId ? m.user2 : m.user1;
-      const lastMessage = m.messages[0] || null;
+    const result = [];
 
-      return {
-        id: m.id,
-        otherUser: publicUser(otherUser),
-        lastMessage: lastMessage
-          ? {
-              id: lastMessage.id,
-              text: lastMessage.text,
-              createdAt: lastMessage.createdAt,
-              fromUserId: lastMessage.fromUserId,
-            }
-          : null,
-      };
-    });
+    for (const match of matches) {
+      const otherUserId = match.user1Id === userId ? match.user2Id : match.user1Id;
+
+      const otherUser = await prisma.user.findUnique({
+        where: { id: otherUserId },
+      });
+
+      const lastMessage = await prisma.message.findFirst({
+        where: { matchId: match.id },
+        orderBy: { createdAt: 'desc' },
+      });
+
+      const unreadCount = await prisma.message.count({
+        where: {
+          matchId: match.id,
+          toUserId: userId,
+          readAt: null,
+        },
+      });
+
+      result.push(formatMatch(userId, match, otherUser, lastMessage, unreadCount));
+    }
 
     return res.json(result);
   } catch (err) {
@@ -563,8 +558,8 @@ app.get('/matches', authMiddleware, async (req, res) => {
   }
 });
 
-// poruke za jedan match
-app.get('/chats/:matchId/messages', authMiddleware, async (req, res) => {
+// GET /matches/:matchId/messages
+app.get('/matches/:matchId/messages', authMiddleware, async (req, res) => {
   try {
     const userId = req.userId;
     const { matchId } = req.params;
@@ -573,8 +568,10 @@ app.get('/chats/:matchId/messages', authMiddleware, async (req, res) => {
       where: { id: matchId },
     });
 
-    if (!match || (match.user1Id !== userId && match.user2Id !== userId)) {
-      return res.status(404).json({ error: 'Match not found' });
+    if (!match) return res.status(404).json({ error: 'Match not found' });
+
+    if (match.user1Id !== userId && match.user2Id !== userId) {
+      return res.status(403).json({ error: 'Not allowed' });
     }
 
     const messages = await prisma.message.findMany({
@@ -582,112 +579,180 @@ app.get('/chats/:matchId/messages', authMiddleware, async (req, res) => {
       orderBy: { createdAt: 'asc' },
     });
 
+    // označi primljene poruke kao pročitane
+    await prisma.message.updateMany({
+      where: {
+        matchId,
+        toUserId: userId,
+        readAt: null,
+      },
+      data: { readAt: new Date() },
+    });
+
     return res.json(messages);
   } catch (err) {
-    console.error('GET /chats/:matchId/messages error:', err);
+    console.error('GET /matches/:matchId/messages error:', err);
     return res.status(500).json({ error: 'Failed to load messages' });
   }
 });
 
-// slanje poruke
-app.post('/chats/:matchId/messages', authMiddleware, async (req, res) => {
+// POST /matches/:matchId/messages
+app.post('/matches/:matchId/messages', authMiddleware, async (req, res) => {
   try {
     const userId = req.userId;
     const { matchId } = req.params;
-    const { text } = req.body;
+    const { content } = req.body;
 
-    if (!text || typeof text !== 'string' || !text.trim()) {
-      return res.status(400).json({ error: 'Message text is required' });
+    if (!content || typeof content !== 'string') {
+      return res.status(400).json({ error: 'Content is required' });
     }
 
     const match = await prisma.match.findUnique({
       where: { id: matchId },
     });
 
-    if (!match || (match.user1Id !== userId && match.user2Id !== userId)) {
-      return res.status(404).json({ error: 'Match not found' });
+    if (!match) return res.status(404).json({ error: 'Match not found' });
+
+    if (match.user1Id !== userId && match.user2Id !== userId) {
+      return res.status(403).json({ error: 'Not allowed' });
     }
+
+    const toUserId = match.user1Id === userId ? match.user2Id : match.user1Id;
 
     const message = await prisma.message.create({
       data: {
         matchId,
         fromUserId: userId,
-        text: text.trim(),
+        toUserId,
+        content,
       },
     });
 
     return res.status(201).json(message);
   } catch (err) {
-    console.error('POST /chats/:matchId/messages error:', err);
+    console.error('POST /matches/:matchId/messages error:', err);
     return res.status(500).json({ error: 'Failed to send message' });
   }
 });
 
-// ----- ANALYTICS / STATS -----
+// DELETE /matches/:matchId – "block/remove" match
+app.delete('/matches/:matchId', authMiddleware, async (req, res) => {
+  const userId = req.userId;
+  const { matchId } = req.params;
 
-// globalni summary (možeš u appu koristiti za "admin" stats)
-app.get('/analytics/summary', authMiddleware, async (req, res) => {
   try {
-    const [totalUsers, totalSwipes, totalMatches, totalMessages] =
+    const match = await prisma.match.findUnique({
+      where: { id: matchId },
+    });
+
+    if (!match) {
+      return res.status(404).json({ error: 'Match not found' });
+    }
+
+    if (match.user1Id !== userId && match.user2Id !== userId) {
+      return res.status(403).json({ error: 'Not allowed' });
+    }
+
+    // obriši poruke
+    await prisma.message.deleteMany({
+      where: { matchId },
+    });
+
+    await prisma.match.delete({
+      where: { id: matchId },
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('DELETE /matches/:matchId error:', err);
+    return res.status(500).json({ error: 'Failed to remove match' });
+  }
+});
+
+// ---------- STATS / ANALYTICS ----------
+
+// GET /me/stats – osobni
+app.get('/me/stats', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.userId;
+
+    const [totalLikes, totalPasses, totalSuperLikes, totalMatches, totalMessagesSent] =
       await Promise.all([
-        prisma.user.count(),
-        prisma.swipe.count(),
-        prisma.match.count(),
-        prisma.message.count(),
+        prisma.swipe.count({
+          where: { fromUserId: userId, direction: 'like' },
+        }),
+        prisma.swipe.count({
+          where: { fromUserId: userId, direction: 'pass' },
+        }),
+        prisma.swipe.count({
+          where: { fromUserId: userId, direction: 'superlike' },
+        }),
+        prisma.match.count({
+          where: {
+            OR: [{ user1Id: userId }, { user2Id: userId }],
+          },
+        }),
+        prisma.message.count({
+          where: { fromUserId: userId },
+        }),
       ]);
+
+    return res.json({
+      totalLikes,
+      totalPasses,
+      totalSuperLikes,
+      totalMatches,
+      totalMessagesSent,
+    });
+  } catch (err) {
+    console.error('GET /me/stats error:', err);
+    return res.status(500).json({ error: 'Failed to load stats' });
+  }
+});
+
+// GET /admin/summary – globalni overview
+app.get('/admin/summary', authMiddleware, async (req, res) => {
+  try {
+    const [totalUsers, totalSwipes, totalMatches, totalMessages] = await Promise.all([
+      prisma.user.count(),
+      prisma.swipe.count(),
+      prisma.match.count(),
+      prisma.message.count(),
+    ]);
+
+    const mostActiveUsers = await prisma.user.findMany({
+      orderBy: { lastActiveAt: 'desc' },
+      take: 10,
+    });
 
     return res.json({
       totalUsers,
       totalSwipes,
       totalMatches,
       totalMessages,
+      mostActiveUsers: mostActiveUsers.map(publicUser),
     });
   } catch (err) {
-    console.error('GET /analytics/summary error:', err);
-    return res.status(500).json({ error: 'Failed to load analytics' });
+    console.error('GET /admin/summary error:', err);
+    return res.status(500).json({ error: 'Failed to load summary' });
   }
 });
 
-// stats za trenutnog usera
-app.get('/analytics/me', authMiddleware, async (req, res) => {
+// ---------- DEBUG (optional) ----------
+
+// reset swipova za trenutnog usera (za testiranje)
+app.post('/debug/reset-my-swipes', authMiddleware, async (req, res) => {
   try {
     const userId = req.userId;
-
-    const [swipesTotal, matchesCount, messagesSent, swipesToday] =
-      await Promise.all([
-        prisma.swipe.count({ where: { fromUserId: userId } }),
-        prisma.match.count({
-          where: {
-            OR: [{ user1Id: userId }, { user2Id: userId }],
-          },
-        }),
-        prisma.message.count({ where: { fromUserId: userId } }),
-        getSwipesTodayCount(userId),
-      ]);
-
-    return res.json({
-      swipesTotal,
-      matchesCount,
-      messagesSent,
-      swipesToday,
-      swipesLimit: SWIPES_PER_DAY,
+    const deleted = await prisma.swipe.deleteMany({
+      where: { fromUserId: userId },
     });
+
+    return res.json({ ok: true, deleted: deleted.count });
   } catch (err) {
-    console.error('GET /analytics/me error:', err);
-    return res.status(500).json({ error: 'Failed to load user stats' });
+    console.error('POST /debug/reset-my-swipes error:', err);
+    return res.status(500).json({ error: 'Failed to reset swipes' });
   }
-});
-
-// ----- 404 & ERROR HANDLER -----
-
-app.use((req, res) => {
-  return res.status(404).json({ error: 'Not found' });
-});
-
-// global error handler (za svaki slučaj)
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  return res.status(500).json({ error: 'Internal server error' });
 });
 
 // ---------- START SERVER ----------
@@ -696,23 +761,27 @@ async function start() {
   try {
     await seedDemoUsers();
 
+    app.get('/', (req, res) => {
+      res.json({ ok: true, message: 'Tinder backend live' });
+    });
+
     app.listen(PORT, () => {
       console.log(`Server listening on port ${PORT}`);
     });
   } catch (err) {
-    console.error('Failed to start server:', err);
+    console.error('Failed to start server', err);
     process.exit(1);
   }
 }
 
 start();
 
-process.on('SIGINT', async () => {
+process.on('SIGTERM', async () => {
   await prisma.$disconnect();
   process.exit(0);
 });
 
-process.on('SIGTERM', async () => {
+process.on('SIGINT', async () => {
   await prisma.$disconnect();
   process.exit(0);
 });

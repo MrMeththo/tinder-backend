@@ -1,3 +1,4 @@
+// server.js
 require('dotenv').config();
 
 const express = require('express');
@@ -16,13 +17,13 @@ try {
 }
 
 const prisma = new PrismaClient();
-
 const app = express();
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
+const DAILY_SWIPE_LIMIT = Number(process.env.DAILY_SWIPE_LIMIT || 50);
 
-// ---------- MIDDLEWARE ----------
+// ---------- GLOBAL MIDDLEWARE ----------
 
 app.use(helmet());
 app.use(
@@ -36,7 +37,7 @@ if (morgan) {
   app.use(morgan('tiny'));
 }
 
-// global rate limit (osnovna zaštita)
+// global rate limit
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 1000,
@@ -50,15 +51,10 @@ const authLimiter = rateLimit({
 });
 app.use('/auth', authLimiter);
 
-// helper – javni prikaz usera
+// ---------- HELPERS ----------
+
 function publicUser(user) {
   if (!user) return null;
-
-  const ONLINE_WINDOW_MS = 2 * 60 * 1000; // 2 minute
-  const lastActive = user.lastActiveAt || user.updatedAt || user.createdAt;
-  const isOnline =
-    lastActive && Date.now() - new Date(lastActive).getTime() < ONLINE_WINDOW_MS;
-
   return {
     id: user.id,
     email: user.email,
@@ -66,17 +62,23 @@ function publicUser(user) {
     age: user.age,
     bio: user.bio,
     gender: user.gender,
-    photoUrl: user.photoUrl,
-    createdAt: user.createdAt,
-    lastActiveAt: lastActive,
-    isOnline,
+    photoUrl: user.photoUrl || null,
   };
 }
 
-// auth middleware
-async function authMiddleware(req, res, next) {
+function createToken(user) {
+  return jwt.sign(
+    { userId: user.id },
+    JWT_SECRET,
+    { expiresIn: '30d' }
+  );
+}
+
+function authMiddleware(req, res, next) {
   const header = req.headers.authorization || '';
-  const [, token] = header.split(' ');
+  const token = header.startsWith('Bearer ')
+    ? header.slice(7)
+    : null;
 
   if (!token) {
     return res.status(401).json({ error: 'Missing auth token' });
@@ -85,25 +87,12 @@ async function authMiddleware(req, res, next) {
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     req.userId = payload.userId;
-
-    // update lastActiveAt
-    try {
-      await prisma.user.update({
-        where: { id: payload.userId },
-        data: { lastActiveAt: new Date() },
-      });
-    } catch (e) {
-      console.error('Failed to update lastActiveAt', e);
-    }
-
     next();
   } catch (err) {
-    console.error('authMiddleware error', err);
-    return res.status(401).json({ error: 'Invalid token' });
+    console.error('authMiddleware error:', err);
+    return res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
-
-// ---------- SEED DEMO USERS ----------
 
 async function seedDemoUsers() {
   const demoUsers = [
@@ -154,7 +143,21 @@ async function seedDemoUsers() {
     });
   }
 
-  console.log('Seeded demo users (ana/marko/lucija/ivan @ example.com)');
+  console.log('Seeded demo users (ana/marko/lucija/ivan @ example.com, pass: password123)');
+}
+
+async function getTodaySwipeCount(userId) {
+  const startOfDay = new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+
+  const count = await prisma.swipe.count({
+    where: {
+      fromUserId: userId,
+      createdAt: { gte: startOfDay },
+    },
+  });
+
+  return count;
 }
 
 // ---------- AUTH ROUTES ----------
@@ -164,7 +167,9 @@ app.post('/auth/register', async (req, res) => {
     const { email, password, name, age, gender } = req.body;
 
     if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
+      return res
+        .status(400)
+        .json({ error: 'Email and password are required' });
     }
 
     const existing = await prisma.user.findUnique({ where: { email } });
@@ -184,9 +189,7 @@ app.post('/auth/register', async (req, res) => {
       },
     });
 
-    const token = jwt.sign({ userId: user.id }, JWT_SECRET, {
-      expiresIn: '30d',
-    });
+    const token = createToken(user);
 
     return res.status(201).json({
       token,
@@ -203,7 +206,9 @@ app.post('/auth/login', async (req, res) => {
     const { email, password } = req.body;
 
     if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
+      return res
+        .status(400)
+        .json({ error: 'Email and password are required' });
     }
 
     const user = await prisma.user.findUnique({ where: { email } });
@@ -216,9 +221,7 @@ app.post('/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    const token = jwt.sign({ userId: user.id }, JWT_SECRET, {
-      expiresIn: '30d',
-    });
+    const token = createToken(user);
 
     return res.json({
       token,
@@ -230,14 +233,17 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
-// ---------- ME / PROFILE ----------
+// ---------- PROFILE / ME ----------
 
 app.get('/me', authMiddleware, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({
       where: { id: req.userId },
     });
-    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
 
     return res.json(publicUser(user));
   } catch (err) {
@@ -290,26 +296,7 @@ app.put('/me', authMiddleware, async (req, res) => {
   }
 });
 
-// ---------- RECOMMENDATIONS / SWIPES ----------
-
-// helper – dnevni limit swipova
-const DAILY_SWIPE_LIMIT = 50;
-
-async function getTodaySwipeCount(userId) {
-  const startOfDay = new Date();
-  startOfDay.setHours(0, 0, 0, 0);
-
-  const count = await prisma.swipe.count({
-    where: {
-      fromUserId: userId,
-      createdAt: {
-        gte: startOfDay,
-      },
-    },
-  });
-
-  return count;
-}
+// ---------- PROFILES / RECOMMENDATIONS ----------
 
 // GET /profiles/recommendations?gender=&minAge=&maxAge=
 app.get('/profiles/recommendations', authMiddleware, async (req, res) => {
@@ -317,39 +304,12 @@ app.get('/profiles/recommendations', authMiddleware, async (req, res) => {
     const userId = req.userId;
     const { gender, minAge, maxAge } = req.query;
 
-    const me = await prisma.user.findUnique({ where: { id: userId } });
-    if (!me) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    // ids koje sam već swipeao ili matchao
-    const swipes = await prisma.swipe.findMany({
-      where: { fromUserId: userId },
-      select: { toUserId: true },
-    });
-
-    const matched = await prisma.match.findMany({
-      where: {
-        OR: [{ user1Id: userId }, { user2Id: userId }],
-      },
-      select: {
-        user1Id: true,
-        user2Id: true,
-      },
-    });
-
-    const excludedIds = new Set();
-    swipes.forEach((s) => excludedIds.add(s.toUserId));
-    matched.forEach((m) => {
-      excludedIds.add(m.user1Id);
-      excludedIds.add(m.user2Id);
-    });
-    excludedIds.add(userId);
-
+    // isključi sebe
     const where = {
-      id: { notIn: Array.from(excludedIds) },
+      id: { not: userId },
     };
 
+    // opcionalni filteri
     if (gender && typeof gender === 'string' && gender !== 'male/female/other') {
       where.gender = gender;
     }
@@ -362,10 +322,7 @@ app.get('/profiles/recommendations', authMiddleware, async (req, res) => {
 
     const candidates = await prisma.user.findMany({
       where,
-      orderBy: [
-        { createdAt: 'desc' },
-        { id: 'asc' },
-      ],
+      orderBy: { createdAt: 'desc' },
       take: 50,
     });
 
@@ -375,6 +332,8 @@ app.get('/profiles/recommendations', authMiddleware, async (req, res) => {
     return res.status(500).json({ error: 'Failed to load profiles' });
   }
 });
+
+// ---------- SWIPES ----------
 
 // POST /swipes { toUserId, direction }
 app.post('/swipes', authMiddleware, async (req, res) => {
@@ -395,7 +354,6 @@ app.post('/swipes', authMiddleware, async (req, res) => {
       });
     }
 
-    // spremi swipe
     const swipe = await prisma.swipe.create({
       data: {
         fromUserId,
@@ -404,10 +362,10 @@ app.post('/swipes', authMiddleware, async (req, res) => {
       },
     });
 
-    // jel postoji obostrani like?
+    // check for match
     let match = null;
     if (direction === 'like' || direction === 'superlike') {
-      const reverseLike = await prisma.swipe.findFirst({
+      const reverse = await prisma.swipe.findFirst({
         where: {
           fromUserId: toUserId,
           toUserId: fromUserId,
@@ -415,8 +373,7 @@ app.post('/swipes', authMiddleware, async (req, res) => {
         },
       });
 
-      if (reverseLike) {
-        // provjeri da već nemamo match
+      if (reverse) {
         match = await prisma.match.findFirst({
           where: {
             OR: [
@@ -462,7 +419,7 @@ app.post('/swipes/undo', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'No swipe to undo' });
     }
 
-    // ako je od tog swipa nastao match, brišemo ga + poruke
+    // ako je od tog swipa nastao match, brišemo i match i poruke
     const match = await prisma.match.findFirst({
       where: {
         OR: [
@@ -495,25 +452,6 @@ app.post('/swipes/undo', authMiddleware, async (req, res) => {
 
 // ---------- MATCHES & CHAT ----------
 
-// helper – format matcha s drugim userom
-function formatMatch(meId, match, otherUser, lastMessage, unreadCount) {
-  return {
-    id: match.id,
-    createdAt: match.createdAt,
-    otherUser: publicUser(otherUser),
-    lastMessage: lastMessage
-      ? {
-          id: lastMessage.id,
-          fromUserId: lastMessage.fromUserId,
-          toUserId: lastMessage.toUserId,
-          content: lastMessage.content,
-          createdAt: lastMessage.createdAt,
-        }
-      : null,
-    unreadCount,
-  };
-}
-
 // GET /matches
 app.get('/matches', authMiddleware, async (req, res) => {
   try {
@@ -524,32 +462,37 @@ app.get('/matches', authMiddleware, async (req, res) => {
         OR: [{ user1Id: userId }, { user2Id: userId }],
       },
       orderBy: { createdAt: 'desc' },
+      include: {
+        user1: true,
+        user2: true,
+        messages: {
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+        },
+      },
     });
 
-    const result = [];
+    const result = matches.map((m) => {
+      const otherUser = m.user1Id === userId ? m.user2 : m.user1;
+      const lastMessage = m.messages[0] || null;
 
-    for (const match of matches) {
-      const otherUserId = match.user1Id === userId ? match.user2Id : match.user1Id;
-
-      const otherUser = await prisma.user.findUnique({
-        where: { id: otherUserId },
-      });
-
-      const lastMessage = await prisma.message.findFirst({
-        where: { matchId: match.id },
-        orderBy: { createdAt: 'desc' },
-      });
-
-      const unreadCount = await prisma.message.count({
-        where: {
-          matchId: match.id,
-          toUserId: userId,
-          readAt: null,
-        },
-      });
-
-      result.push(formatMatch(userId, match, otherUser, lastMessage, unreadCount));
-    }
+      return {
+        id: m.id,
+        createdAt: m.createdAt,
+        otherUser: publicUser(otherUser),
+        lastMessage: lastMessage
+          ? {
+              id: lastMessage.id,
+              matchId: lastMessage.matchId,
+              fromUserId: lastMessage.fromUserId,
+              // API polje "content", DB polje "text"
+              content: lastMessage.text,
+              createdAt: lastMessage.createdAt,
+            }
+          : null,
+        unreadCount: 0, // nemamo readAt u bazi, pa 0
+      };
+    });
 
     return res.json(result);
   } catch (err) {
@@ -568,7 +511,9 @@ app.get('/matches/:matchId/messages', authMiddleware, async (req, res) => {
       where: { id: matchId },
     });
 
-    if (!match) return res.status(404).json({ error: 'Match not found' });
+    if (!match) {
+      return res.status(404).json({ error: 'Match not found' });
+    }
 
     if (match.user1Id !== userId && match.user2Id !== userId) {
       return res.status(403).json({ error: 'Not allowed' });
@@ -579,17 +524,20 @@ app.get('/matches/:matchId/messages', authMiddleware, async (req, res) => {
       orderBy: { createdAt: 'asc' },
     });
 
-    // označi primljene poruke kao pročitane
-    await prisma.message.updateMany({
-      where: {
-        matchId,
-        toUserId: userId,
-        readAt: null,
-      },
-      data: { readAt: new Date() },
-    });
+    const mapped = messages.map((msg) => ({
+      id: msg.id,
+      matchId: msg.matchId,
+      fromUserId: msg.fromUserId,
+      // toUserId iz matcha – drugi user u matchu
+      toUserId:
+        msg.fromUserId === match.user1Id
+          ? match.user2Id
+          : match.user1Id,
+      content: msg.text,
+      createdAt: msg.createdAt,
+    }));
 
-    return res.json(messages);
+    return res.json(mapped);
   } catch (err) {
     console.error('GET /matches/:matchId/messages error:', err);
     return res.status(500).json({ error: 'Failed to load messages' });
@@ -611,31 +559,40 @@ app.post('/matches/:matchId/messages', authMiddleware, async (req, res) => {
       where: { id: matchId },
     });
 
-    if (!match) return res.status(404).json({ error: 'Match not found' });
+    if (!match) {
+      return res.status(404).json({ error: 'Match not found' });
+    }
 
     if (match.user1Id !== userId && match.user2Id !== userId) {
       return res.status(403).json({ error: 'Not allowed' });
     }
 
-    const toUserId = match.user1Id === userId ? match.user2Id : match.user1Id;
-
-    const message = await prisma.message.create({
+    const msg = await prisma.message.create({
       data: {
         matchId,
         fromUserId: userId,
-        toUserId,
-        content,
+        text: content.trim(), // DB kolona "text"
       },
     });
 
-    return res.status(201).json(message);
+    const toUserId =
+      userId === match.user1Id ? match.user2Id : match.user1Id;
+
+    return res.status(201).json({
+      id: msg.id,
+      matchId: msg.matchId,
+      fromUserId: msg.fromUserId,
+      toUserId,
+      content: msg.text,
+      createdAt: msg.createdAt,
+    });
   } catch (err) {
     console.error('POST /matches/:matchId/messages error:', err);
     return res.status(500).json({ error: 'Failed to send message' });
   }
 });
 
-// DELETE /matches/:matchId – "block/remove" match
+// DELETE /matches/:matchId – remove/block
 app.delete('/matches/:matchId', authMiddleware, async (req, res) => {
   const userId = req.userId;
   const { matchId } = req.params;
@@ -653,7 +610,6 @@ app.delete('/matches/:matchId', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'Not allowed' });
     }
 
-    // obriši poruke
     await prisma.message.deleteMany({
       where: { matchId },
     });
@@ -671,7 +627,6 @@ app.delete('/matches/:matchId', authMiddleware, async (req, res) => {
 
 // ---------- STATS / ANALYTICS ----------
 
-// GET /me/stats – osobni
 app.get('/me/stats', authMiddleware, async (req, res) => {
   try {
     const userId = req.userId;
@@ -710,18 +665,19 @@ app.get('/me/stats', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /admin/summary – globalni overview
+// admin summary – global
 app.get('/admin/summary', authMiddleware, async (req, res) => {
   try {
-    const [totalUsers, totalSwipes, totalMatches, totalMessages] = await Promise.all([
-      prisma.user.count(),
-      prisma.swipe.count(),
-      prisma.match.count(),
-      prisma.message.count(),
-    ]);
+    const [totalUsers, totalSwipes, totalMatches, totalMessages] =
+      await Promise.all([
+        prisma.user.count(),
+        prisma.swipe.count(),
+        prisma.match.count(),
+        prisma.message.count(),
+      ]);
 
-    const mostActiveUsers = await prisma.user.findMany({
-      orderBy: { lastActiveAt: 'desc' },
+    const newestUsers = await prisma.user.findMany({
+      orderBy: { createdAt: 'desc' },
       take: 10,
     });
 
@@ -730,7 +686,7 @@ app.get('/admin/summary', authMiddleware, async (req, res) => {
       totalSwipes,
       totalMatches,
       totalMessages,
-      mostActiveUsers: mostActiveUsers.map(publicUser),
+      newestUsers: newestUsers.map(publicUser),
     });
   } catch (err) {
     console.error('GET /admin/summary error:', err);
@@ -738,9 +694,8 @@ app.get('/admin/summary', authMiddleware, async (req, res) => {
   }
 });
 
-// ---------- DEBUG (optional) ----------
+// ---------- DEBUG ----------
 
-// reset swipova za trenutnog usera (za testiranje)
 app.post('/debug/reset-my-swipes', authMiddleware, async (req, res) => {
   try {
     const userId = req.userId;
@@ -755,15 +710,26 @@ app.post('/debug/reset-my-swipes', authMiddleware, async (req, res) => {
   }
 });
 
-// ---------- START SERVER ----------
+// ---------- ROOT & ERROR HANDLERS ----------
+
+app.get('/', (req, res) => {
+  return res.json({ ok: true, message: 'Tinder backend live' });
+});
+
+app.use((req, res) => {
+  return res.status(404).json({ error: 'Not found' });
+});
+
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  return res.status(500).json({ error: 'Internal server error' });
+});
+
+// ---------- START ----------
 
 async function start() {
   try {
     await seedDemoUsers();
-
-    app.get('/', (req, res) => {
-      res.json({ ok: true, message: 'Tinder backend live' });
-    });
 
     app.listen(PORT, () => {
       console.log(`Server listening on port ${PORT}`);

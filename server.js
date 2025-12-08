@@ -394,10 +394,22 @@ app.post('/swipes', authMiddleware, async (req, res) => {
       }
     }
 
+    // EXTRA za "It's a match" modal:
+    // vratimo i otherUser ako je nastao match, plus isMatch flag.
+    let otherUser = null;
+    if (match) {
+      const u = await prisma.user.findUnique({
+        where: { id: toUserId },
+      });
+      otherUser = publicUser(u);
+    }
+
     return res.json({
       swipeId: swipe.id,
-      match: !!match,
+      match: !!match,      // stari naziv, ako ga koristiš
+      isMatch: !!match,    // novi, jasniji za frontend
       matchId: match ? match.id : null,
+      otherUser,           // null ako nije match, objekt ako je
     });
   } catch (err) {
     console.error('POST /swipes error:', err);
